@@ -2,14 +2,14 @@
 Descarga del tiempo horario de Madrid desde la API de histórico de Open-Meteo.
 
 Guarda la respuesta en bruto (un JSON por mes) en la carpeta indicada.
-Si la API falla, copia los JSON de respaldo de la carpeta de fallback.
+Si la API falla, deja de llamarla y copia los JSON de respaldo de la carpeta de fallback.
 """
 
 import json
 import os
 import shutil
 import time
-from datetime import date, timedelta
+from datetime import timedelta
 
 import requests
 
@@ -60,9 +60,11 @@ def pedir_con_reintentos(params):
                 # 400, 403...: reintentar no lo arregla, se para aquí
                 raise RuntimeError(f"HTTP {respuesta.status_code}: {respuesta.text[:200]}")
 
-            print(f"  HTTP {respuesta.status_code}")
+            print(f"  HTTP {respuesta.status_code}: {respuesta.text[:150]}")
 
         espera = 2 ** intento                 # backoff: 2, 4, 8, 16 segundos
+        if respuesta is not None and respuesta.headers.get("Retry-After", "").isdigit():
+            espera = int(respuesta.headers["Retry-After"])
         print(f"  Reintento {intento}/{MAX_REINTENTOS} en {espera} s")
         time.sleep(espera)
 
@@ -87,15 +89,17 @@ def usar_fallback(nombre_fichero, carpeta_fallback, carpeta_destino):
     origen = os.path.join(carpeta_fallback, nombre_fichero)
     if not os.path.exists(origen):
         return False
-    shutil.copy(origen, os.path.join(carpeta_destino, nombre_fichero))
+    shutil.copy2(origen, os.path.join(carpeta_destino, nombre_fichero))   # conserva la fecha original
     return True
 
 
 def descargar_periodo(desde, hasta, carpeta_destino, carpeta_fallback=None):
     """Descarga mes a mes el periodo indicado y guarda un JSON por mes.
-    Devuelve un resumen con el origen de cada fichero (api, existente o fallback)."""
+    Si la API falla una vez, deja de llamarla y usa el fallback para el resto.
+    Devuelve un resumen con el origen de cada fichero (api, existente, fallback o error)."""
     os.makedirs(carpeta_destino, exist_ok=True)
     resumen = {}
+    api_disponible = True
 
     for inicio, fin in meses_entre(desde, hasta):
         nombre = f"openmeteo_{inicio:%Y-%m}.json"
@@ -106,27 +110,31 @@ def descargar_periodo(desde, hasta, carpeta_destino, carpeta_fallback=None):
             resumen[nombre] = "existente"
             continue
 
-        params = {
-            "latitude": LATITUD,
-            "longitude": LONGITUD,
-            "start_date": inicio.isoformat(),
-            "end_date": fin.isoformat(),
-            "hourly": ",".join(VARIABLES),
-            "timezone": "GMT",        # UTC: evita la hora repetida del cambio de hora
-        }
+        if api_disponible:
+            params = {
+                "latitude": LATITUD,
+                "longitude": LONGITUD,
+                "start_date": inicio.isoformat(),
+                "end_date": fin.isoformat(),
+                "hourly": ",".join(VARIABLES),
+                "timezone": "GMT",        # UTC: evita la hora repetida del cambio de hora
+            }
+            print(f"Descargando {nombre}...")
+            try:
+                datos = pedir_con_reintentos(params)
+                comprobar_respuesta(datos, inicio, fin)
+                guardar_json(datos, ruta)
+                resumen[nombre] = "api"
+                time.sleep(PAUSA)
+                continue
+            except Exception as error:
+                print(f"  Falla la API ({error}). No se volverá a llamar en esta ejecución.")
+                api_disponible = False
 
-        print(f"Descargando {nombre}...")
-        try:
-            datos = pedir_con_reintentos(params)
-            comprobar_respuesta(datos, inicio, fin)
-            guardar_json(datos, ruta)
-            resumen[nombre] = "api"
-            time.sleep(PAUSA)
-        except Exception as error:
-            print(f"  Falla la API ({error}). Se usa el fallback.")
-            if carpeta_fallback and usar_fallback(nombre, carpeta_fallback, carpeta_destino):
-                resumen[nombre] = "fallback"
-            else:
-                resumen[nombre] = "error"
+        # API no disponible: se usa la copia de respaldo
+        if carpeta_fallback and usar_fallback(nombre, carpeta_fallback, carpeta_destino):
+            resumen[nombre] = "fallback"
+        else:
+            resumen[nombre] = "error"
 
     return resumen
