@@ -2,7 +2,15 @@
 Descarga del tiempo horario de Madrid desde la API de histórico de Open-Meteo.
 
 Guarda la respuesta en bruto (un JSON por mes) en la carpeta indicada.
-Si la API falla, deja de llamarla y copia los JSON de respaldo de la carpeta de fallback.
+
+Comportamiento ante errores:
+- 429 (límite de uso alcanzado): no se reintenta. Se deja de llamar a la API,
+  se intenta completar con el fallback (muestras/openmeteo/) y, si falta algún
+  mes, se detiene la ejecución indicando que se lance el script local.
+- 5xx o error de red: reintentos con backoff exponencial.
+- Otros 4xx (400, 403...): no se reintenta; se pasa al fallback.
+
+Ver docs/incidencia_openmeteo_429.md
 """
 
 import json
@@ -25,9 +33,20 @@ VARIABLES = [
 
 TIMEOUT = 30                  # segundos máximos por petición
 MAX_REINTENTOS = 4
+ESPERA_MAXIMA = 60            # nunca esperar más de 60 s entre reintentos
 PAUSA = 3                     # segundos entre peticiones, para respetar los límites
-CODIGOS_REINTENTABLES = [429, 500, 502, 503, 504]
+CODIGOS_REINTENTABLES = [500, 502, 503, 504]
 CABECERAS = {"User-Agent": "CUNEF-ETL-proyecto-academico"}
+
+MENSAJE_SCRIPT_LOCAL = (
+    "Lanza la descarga desde tu ordenador (VS Code), en la carpeta Entregable_1:\n"
+    "    python scripts/descarga_openmeteo_local.py\n"
+    "Después haz commit y push de muestras/openmeteo/, Pull en Databricks y vuelve a ejecutar."
+)
+
+
+class LimiteApiAlcanzado(Exception):
+    """La API ha respondido 429: se ha agotado el límite de uso para esta IP."""
 
 
 def meses_entre(desde, hasta):
@@ -40,6 +59,14 @@ def meses_entre(desde, hasta):
         meses.append((inicio, fin))
         inicio = fin + timedelta(days=1)
     return meses
+
+
+def motivo_error(respuesta):
+    """Open-Meteo explica el error en el campo 'reason' del JSON."""
+    try:
+        return respuesta.json().get("reason", respuesta.text[:200])
+    except ValueError:
+        return respuesta.text[:200]
 
 
 def pedir_con_reintentos(params):
@@ -56,15 +83,17 @@ def pedir_con_reintentos(params):
             if respuesta.status_code == 200:
                 return respuesta.json()
 
+            if respuesta.status_code == 429:
+                # Límite de uso agotado: reintentar solo empeora las cosas
+                raise LimiteApiAlcanzado(motivo_error(respuesta))
+
             if respuesta.status_code not in CODIGOS_REINTENTABLES:
-                # 400, 403...: reintentar no lo arregla, se para aquí
-                raise RuntimeError(f"HTTP {respuesta.status_code}: {respuesta.text[:200]}")
+                # 400, 403...: reintentar no lo arregla
+                raise RuntimeError(f"HTTP {respuesta.status_code}: {motivo_error(respuesta)}")
 
-            print(f"  HTTP {respuesta.status_code}: {respuesta.text[:150]}")
+            print(f"  HTTP {respuesta.status_code}: {motivo_error(respuesta)}")
 
-        espera = 2 ** intento                 # backoff: 2, 4, 8, 16 segundos
-        if respuesta is not None and respuesta.headers.get("Retry-After", "").isdigit():
-            espera = int(respuesta.headers["Retry-After"])
+        espera = min(2 ** intento, ESPERA_MAXIMA)     # backoff: 2, 4, 8, 16 segundos
         print(f"  Reintento {intento}/{MAX_REINTENTOS} en {espera} s")
         time.sleep(espera)
 
@@ -86,6 +115,8 @@ def guardar_json(datos, ruta):
 
 def usar_fallback(nombre_fichero, carpeta_fallback, carpeta_destino):
     """Copia el JSON de respaldo al destino. Devuelve True si existía."""
+    if not carpeta_fallback:
+        return False
     origen = os.path.join(carpeta_fallback, nombre_fichero)
     if not os.path.exists(origen):
         return False
@@ -95,11 +126,16 @@ def usar_fallback(nombre_fichero, carpeta_fallback, carpeta_destino):
 
 def descargar_periodo(desde, hasta, carpeta_destino, carpeta_fallback=None):
     """Descarga mes a mes el periodo indicado y guarda un JSON por mes.
+
     Si la API falla una vez, deja de llamarla y usa el fallback para el resto.
+    Si el fallo es un 429 y el fallback no cubre todos los meses, lanza
+    LimiteApiAlcanzado con las instrucciones para descargar en local.
+
     Devuelve un resumen con el origen de cada fichero (api, existente, fallback o error)."""
     os.makedirs(carpeta_destino, exist_ok=True)
     resumen = {}
     api_disponible = True
+    limite_alcanzado = None
 
     for inicio, fin in meses_entre(desde, hasta):
         nombre = f"openmeteo_{inicio:%Y-%m}.json"
@@ -127,14 +163,29 @@ def descargar_periodo(desde, hasta, carpeta_destino, carpeta_fallback=None):
                 resumen[nombre] = "api"
                 time.sleep(PAUSA)
                 continue
+            except LimiteApiAlcanzado as error:
+                print(f"  HTTP 429, límite de la API alcanzado: {error}")
+                print("  No se volverá a llamar a la API en esta ejecución.")
+                limite_alcanzado = str(error)
+                api_disponible = False
             except Exception as error:
                 print(f"  Falla la API ({error}). No se volverá a llamar en esta ejecución.")
                 api_disponible = False
 
         # API no disponible: se usa la copia de respaldo
-        if carpeta_fallback and usar_fallback(nombre, carpeta_fallback, carpeta_destino):
+        if usar_fallback(nombre, carpeta_fallback, carpeta_destino):
             resumen[nombre] = "fallback"
         else:
             resumen[nombre] = "error"
+
+    if limite_alcanzado:
+        faltan = [f for f, origen in resumen.items() if origen == "error"]
+        if faltan:
+            raise LimiteApiAlcanzado(
+                f"Límite de la API de Open-Meteo alcanzado ({limite_alcanzado}).\n"
+                f"Faltan {len(faltan)} meses y no están en el fallback: {', '.join(faltan)}.\n"
+                + MENSAJE_SCRIPT_LOCAL
+            )
+        print("Límite de la API alcanzado, pero todos los meses se han completado con el fallback.")
 
     return resumen
